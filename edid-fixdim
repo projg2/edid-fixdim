@@ -19,9 +19,19 @@ def verify_checksum(data):
 					     .format(m))
 
 
+def update_checksum(data):
+	"""
+	Update the checksum at the last byte of data.
+	"""
+	m = sum(data[:-1]) % 0x100
+	data[-1] = 0x100 - m
+
+
 def process_edid(f, visitor):
+	outdata = b''
+
 	# read the initial EDID structure
-	data = f.read(128)
+	data = memoryview(bytearray(f.read(128)))
 	if len(data) < 128:
 		raise ValueError('Truncated EDID structure')
 	if data[:8] != b'\x00\xff\xff\xff\xff\xff\xff\x00':
@@ -35,6 +45,9 @@ def process_edid(f, visitor):
 	for desc in (data[54:72], data[72:90], data[90:108], data[108:126]):
 		visitor.descriptor(desc)
 
+	visitor.post_block(data)
+	outdata += data
+
 	# read extensions
 	numext = data[126]
 	while numext > 0:
@@ -44,7 +57,7 @@ def process_edid(f, visitor):
 		if extdata == b'\x02':
 			# CEA EDID
 			print('CEA EDID found')
-			extdata += f.read(127)
+			extdata = memoryview(bytearray(extdata + f.read(127)))
 			if len(extdata) < 128:
 				raise ValueError('Truncated CEA EDID extension')
 			verify_checksum(extdata)
@@ -56,6 +69,9 @@ def process_edid(f, visitor):
 					break
 				visitor.descriptor(desc)
 				dtd_start += len(desc)
+
+			visitor.post_block(extdata)
+			outdata += extdata
 		else:
 			raise NotImplementedError('Unsupported extension: {}'.format(extdata[0]))
 
@@ -63,6 +79,8 @@ def process_edid(f, visitor):
 
 	if f.read(1):
 		raise ValueError('Data past last extension found')
+
+	return outdata
 
 
 class GetVisitor(object):
@@ -79,12 +97,54 @@ class GetVisitor(object):
 		h = data[13] | ((data[14] & 0x0f) << 8)
 		print('Detailed timing desc: {} mm x {} mm'.format(w, h))
 
+	def post_block(self, data):
+		pass
+
+
+class SetVisitor(object):
+	def __init__(self, new_dims):
+		self.new_dims = new_dims
+		self.w_lsb = new_dims.width & 0xff
+		self.h_lsb = new_dims.height & 0xff
+		self.wh_msb = ((new_dims.width & 0xf00) >> 4
+				      |(new_dims.height & 0xf00) >> 8)
+
+	def edid_structure(self, data):
+		data[21] = round(self.new_dims.width / 10)
+		data[22] = round(self.new_dims.height / 10)
+		print('EDID structure updated to {} cm x {} cm'.format(*data[21:23]))
+
+	def descriptor(self, data):
+		if data[:2] == b'\x00\x00':
+			# not a timing descriptor
+			return
+
+		data[12] = self.w_lsb
+		data[13] = self.h_lsb
+		data[14] = self.wh_msb
+		print('Detailed timing desc updated to {} mm x {} mm'.format(
+			self.new_dims.width, self.new_dims.height))
+
+	def post_block(self, data):
+		update_checksum(data)
+
+
+class DimString(object):
+	def __init__(self, val):
+		self.width, self.height = (int(x) for x in val.split('x', 1))
+
+	def __repr__(self):
+		return 'DimString("{}x{}")'.format(self.width, self.height)
+
 
 def main(prog_name, *argv):
 	argp = argparse.ArgumentParser(prog=prog_name)
 	act = argp.add_mutually_exclusive_group()
 	act.add_argument('-g', '--get', action='store_true',
 					 help='Get screen dimensions from EDID')
+	act.add_argument('-s', '--set', type=DimString,
+					 metavar='WIDTHxHEIGHT',
+					 help='Set screen dimensions (in mm)')
 	argp.add_argument('file',
 				      help='Binary EDID dump to process/modify')
 	vals = argp.parse_args(argv)
@@ -92,11 +152,18 @@ def main(prog_name, *argv):
 	if vals.get:
 		mode = 'rb'
 		visitor = GetVisitor()
+	elif vals.set is not None:
+		mode = 'r+b'
+		visitor = SetVisitor(vals.set)
 	else:
 		argp.error('No action specified')
 
 	with open(vals.file, mode) as f:
-		process_edid(f, visitor)
+		outdata = process_edid(f, visitor)
+
+		if vals.set is not None:
+			f.seek(0)
+			f.write(outdata)
 
 	return 0
 
