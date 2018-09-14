@@ -1,0 +1,105 @@
+#!/usr/bin/env python
+# vim:se fileencoding=utf-8 :
+# Fix EDID screen dimensions
+# (c) 2018 Michał Górny
+# Released under the terms of 2-clause BSD license
+
+import argparse
+import sys
+
+
+def verify_checksum(data):
+	"""
+	Verify the EDID checksum -- that is, that sum of all bytes mod 0x100
+	in the block equals to zero.
+	"""
+	m = sum(data) % 0x100
+	if m != 0:
+		raise ValueError('EDID checksum mismatch: remainder is {}'
+					     .format(m))
+
+
+def process_edid(f, visitor):
+	# read the initial EDID structure
+	data = f.read(128)
+	if len(data) < 128:
+		raise ValueError('Truncated EDID structure')
+	if data[:8] != b'\x00\xff\xff\xff\xff\xff\xff\x00':
+		raise ValueError('EDID magic bytes not found')
+	if data[18] != 1:
+		raise ValueError('Unsupported EDID version: {}'.format(data[18]))
+	verify_checksum(data)
+	visitor.edid_structure(data)
+
+	# visit descriptor blocks
+	for desc in (data[54:72], data[72:90], data[90:108], data[108:126]):
+		visitor.descriptor(desc)
+
+	# read extensions
+	numext = data[126]
+	while numext > 0:
+		extdata = f.read(1)
+		if len(extdata) == 0:
+			raise ValueError('Expected extension block missing')
+		if extdata == b'\x02':
+			# CEA EDID
+			print('CEA EDID found')
+			extdata += f.read(127)
+			if len(extdata) < 128:
+				raise ValueError('Truncated CEA EDID extension')
+			verify_checksum(extdata)
+
+			dtd_start = extdata[2]
+			while dtd_start != 0:
+				desc = extdata[dtd_start:dtd_start+18]
+				if desc[:2] == b'\x00\x00':
+					break
+				visitor.descriptor(desc)
+				dtd_start += len(desc)
+		else:
+			raise NotImplementedError('Unsupported extension: {}'.format(extdata[0]))
+
+		numext -= 1
+
+	if f.read(1):
+		raise ValueError('Data past last extension found')
+
+
+class GetVisitor(object):
+	def edid_structure(self, data):
+		w, h = data[21:23]
+		print('EDID structure: {} cm x {} cm'.format(w, h))
+
+	def descriptor(self, data):
+		if data[:2] == b'\x00\x00':
+			# not a timing descriptor
+			return
+
+		w = data[12] | ((data[14] & 0xf0) << 4)
+		h = data[13] | ((data[14] & 0x0f) << 8)
+		print('Detailed timing desc: {} mm x {} mm'.format(w, h))
+
+
+def main(prog_name, *argv):
+	argp = argparse.ArgumentParser(prog=prog_name)
+	act = argp.add_mutually_exclusive_group()
+	act.add_argument('-g', '--get', action='store_true',
+					 help='Get screen dimensions from EDID')
+	argp.add_argument('file',
+				      help='Binary EDID dump to process/modify')
+	vals = argp.parse_args(argv)
+
+	if vals.get:
+		mode = 'rb'
+		visitor = GetVisitor()
+	else:
+		argp.error('No action specified')
+
+	with open(vals.file, mode) as f:
+		process_edid(f, visitor)
+
+	return 0
+
+
+if __name__ == '__main__':
+	sys.exit(main(*sys.argv))
